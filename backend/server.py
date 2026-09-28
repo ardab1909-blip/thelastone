@@ -28,11 +28,11 @@ import billing
 from auth import get_current_user
 
 # ---------- Database & Logging ----------
-client = AsyncIOMotorClient(os.environ["MONGO_URL"])
-db = client[os.environ["DB_NAME"]]
+mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+db_name = os.environ.get("DB_NAME", "weirdstudio")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+client = AsyncIOMotorClient(mongo_url)
+db = client[db_name]
 
 # ---------- Lifecycle (Lifespan) ----------
 @asynccontextmanager
