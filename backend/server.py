@@ -28,7 +28,11 @@ import billing
 from auth import get_current_user
 
 # ---------- Database & Logging ----------
-mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+mongo_url = os.environ.get("MONGO_URL")
+if not mongo_url or "localhost" in mongo_url:
+    # Eğer Render'da MONGO_URL tanımlanmadıysa veya yanlışlıkla localhost kaldıysa çökmesini engellemek için uyarı verelim
+    raise ValueError("HATA: Render Environment kısmında MONGO_URL tanımlanmamış veya yanlış girilmiş!")
+
 db_name = os.environ.get("DB_NAME", "weirdstudio")
 
 client = AsyncIOMotorClient(mongo_url)
