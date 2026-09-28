@@ -26,6 +26,8 @@ from storage import put_object, get_object, init_storage, APP_NAME
 import auth
 import billing
 from auth import get_current_user
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ---------- Database & Logging ----------
 mongo_url = os.environ.get("MONGO_URL")
