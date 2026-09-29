@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # ---------- Config (hepsi env'den; varsayılanlar eski davranışı korur) ----------
 MONGO_URL = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
 DB_NAME = os.environ.get("DB_NAME", "weirdstudio")
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://thelastone-07fj.onrender.com").rstrip("/")
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://thelastone-o7fj.onrender.com").rstrip("/")
 CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
 
 AUDIO_CONTENT_TYPES = {
