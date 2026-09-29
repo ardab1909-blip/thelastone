@@ -26,15 +26,13 @@ from storage import put_object, get_object, init_storage, APP_NAME
 import auth
 import billing
 from auth import get_current_user
+
+# ---------- Logging Setup ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Database & Logging ----------
-mongo_url = os.environ.get("MONGO_URL")
-if not mongo_url or "localhost" in mongo_url:
-    # Eğer Render'da MONGO_URL tanımlanmadıysa veya yanlışlıkla localhost kaldıysa çökmesini engellemek için uyarı verelim
-    raise ValueError("HATA: Render Environment kısmında MONGO_URL tanımlanmamış veya yanlış girilmiş!")
-
+# ---------- Database ----------
+mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
 db_name = os.environ.get("DB_NAME", "weirdstudio")
 
 client = AsyncIOMotorClient(mongo_url)
@@ -56,7 +54,6 @@ async def lifespan(app: FastAPI):
     await db.checkouts.create_index("token", unique=True)
     await db.billing_profiles.create_index("user_id", unique=True)
     
-    
     asyncio.create_task(billing.renewal_loop())
     try:
         init_storage()
@@ -71,26 +68,20 @@ async def lifespan(app: FastAPI):
 
 # ---------- App Initialization ----------
 app = FastAPI(title="WEIRD STUDIO Stream Deck Pro API", lifespan=lifespan)
-UPLOAD_DIR = ROOT_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
-# CORS middleware rotalardan ÖNCE eklenmeli
-cors_origins = os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+# CORS middleware (Tüm kaynaklardan gelen isteklere izin veriyoruz)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins if cors_origins != ["*"] else ["*"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# 1. uploads klasörünü tam yol ile otomatik oluştur
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# 2. Yüklenen dosyaların taranabilmesi için statik klasör olarak dışa aç
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+# Uploads klasörü
+UPLOAD_DIR = ROOT_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 api_router = APIRouter(prefix="/api")
 
@@ -305,19 +296,15 @@ async def put_settings(payload: UserSettingsUpdate, user=Depends(get_current_use
 @api_router.post("/upload/audio")
 async def upload_audio(file: UploadFile = File(...)):
     try:
-        # Dosya uzantısını güvenli şekilde al
         file_ext = os.path.splitext(file.filename)[1] or ".mp3"
         safe_name = f"{uuid.uuid4().hex}{file_ext}"
-        
-        # 'str / str' hatasını önlemek için os.path.join kullanıyoruz
         file_path = os.path.join(UPLOAD_DIR, safe_name)
 
-        # Dosyayı lokal backend/uploads klasörüne kaydet
         with open(file_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
 
-        file_url = f"http://localhost:8000/uploads/{safe_name}"
+        file_url = f"https://thelastone-07fj.onrender.com/uploads/{safe_name}"
 
         return {
             "id": safe_name,
@@ -334,12 +321,12 @@ async def upload_audio(file: UploadFile = File(...)):
 @api_router.get("/uploads")
 async def list_uploads(user=Depends(get_current_user)):
     docs = await db.files.find({"user_id": user["id"], "is_deleted": False},
-                               {"_id": 0, "storage_path": 0}).sort("created_at", -1).to_list(200)
+                              {"_id": 0, "storage_path": 0}).sort("created_at", -1).to_list(200)
     profiles = await db.profiles.find({"user_id": user["id"]}, {"_id": 0, "name": 1, "tiles.index": 1, "tiles.sound_url": 1}).to_list(200)
     for d in docs:
         d["url"] = f"/api/uploads/{d['id']}"
         d["display_name"] = d.get("display_name") or d["original_filename"]
-        d["used_by"] = [{"profile": p["name"], "index": t["index"]} for p in profiles for t in p["tiles"] if t.get("sound_url") == d["url"]]
+        d["used_by"] = [{"profile": p["name"], "index": t["index"]} for p in profiles for t in p["tiles"] if t.get("sound_url"] == d["url"]]
     return docs
 
 class UploadRename(BaseModel):
