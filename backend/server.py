@@ -26,6 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from storage import get_object, init_storage
 import auth
 import billing
+import pii
 from auth import get_current_user
 
 # ---------- Logging ----------
@@ -101,6 +102,10 @@ async def create_indexes() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await create_indexes()
+    try:
+        pii.check_config()
+    except Exception as e:
+        logger.error(f"PII_ENCRYPTION_KEY eksik ya da hatalı, fatura bilgileri kaydedilemez: {e}")
     renewal_task = asyncio.create_task(billing.renewal_loop())
     try:
         init_storage()

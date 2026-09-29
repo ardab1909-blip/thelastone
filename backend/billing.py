@@ -1,21 +1,23 @@
 """Billing: iyzico Checkout Form (card + 3DS hosted by iyzico) with stored-card monthly renewals.
 PRO = ₺149/ay. First charge via hosted form (registerCard), renewals charged server-side from the stored card."""
 import os
+import re
 import json
+import html
 import uuid
 import asyncio
 import logging
 import calendar
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
-from urllib.parse import parse_qs
 
 import iyzipay
 from fastapi import APIRouter, HTTPException, Depends, Request
-from fastapi.responses import PlainTextResponse, RedirectResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import PlainTextResponse, HTMLResponse
+from pydantic import BaseModel, Field, field_validator
 
 from auth import get_current_user, public_user
+from pii import encrypt_pii, decrypt_pii, is_masked, mask_identity, mask_phone, protect
 
 logger = logging.getLogger(__name__)
 db = None
@@ -25,6 +27,9 @@ SECRET = os.environ.get("IYZICO_SECRET_KEY", "")
 MERCHANT_ID = os.environ.get("IYZICO_MERCHANT_ID", "")
 BASE = os.environ.get("IYZICO_BASE_URL", "https://sandbox-api.iyzipay.com").rstrip("/")
 OPTIONS = {"api_key": API_KEY, "secret_key": SECRET, "base_url": BASE.replace("https://", "")}
+
+# iyzico'nun 3DS sonrası tarayıcıyı yönlendireceği herkese açık backend adresi (Render adresin)
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://thelastone-07fj.onrender.com").rstrip("/")
 
 PLAN = {"name": "WEIRD STUDIO PRO — Aylık", "price": 149.0, "currency": "TRY", "symbol": "₺"}
 RENEW_CHECK_SECONDS = 3600
@@ -84,18 +89,53 @@ async def iyzi(resource, method: str, payload: dict) -> Dict[str, Any]:
 class BillingProfile(BaseModel):
     name: str = Field(min_length=2, max_length=40)
     surname: str = Field(min_length=2, max_length=40)
-    gsm_number: str = Field(min_length=10, max_length=16, pattern=r"^\+?\d{10,15}$")
-    identity_number: str = Field(min_length=11, max_length=11, pattern=r"^\d{11}$")
+    # Telefon ve TC, uygulama tarafından maskeli (ör. *******8901) geri gönderilebilir; bu durumda kayıtlı değer korunur.
+    gsm_number: str = Field(min_length=10, max_length=16)
+    identity_number: str = Field(min_length=11, max_length=11)
     address: str = Field(min_length=5, max_length=160)
     city: str = Field(min_length=2, max_length=40)
     zip_code: str = Field(default="", max_length=10)
 
+    @field_validator("gsm_number")
+    @classmethod
+    def _check_gsm(cls, v: str) -> str:
+        pattern = r"\+?[\d*]{10,15}" if is_masked(v) else r"\+?\d{10,15}"
+        if not re.fullmatch(pattern, v):
+            raise ValueError("Geçersiz telefon numarası")
+        return v
+
+    @field_validator("identity_number")
+    @classmethod
+    def _check_identity(cls, v: str) -> str:
+        pattern = r"[\d*]{11}" if is_masked(v) else r"\d{11}"
+        if not re.fullmatch(pattern, v):
+            raise ValueError("Geçersiz TC kimlik numarası")
+        return v
+
 
 class CheckoutIn(BaseModel):
-    origin_url: str = Field(max_length=200)
+    origin_url: str = Field(default="", max_length=200)
 
 
 router = APIRouter(prefix="/billing", tags=["billing"])
+
+
+def _safe_decrypt(value: str) -> str:
+    try:
+        return decrypt_pii(value or "")
+    except RuntimeError as e:
+        logger.error("PII çözülemedi: %s", e)
+        return ""
+
+
+def _public_profile(p: Dict[str, Any]) -> Dict[str, Any]:
+    """İstemciye dönen profilde TC ve telefon maskelidir."""
+    out = dict(p)
+    if out.get("identity_number"):
+        out["identity_number"] = mask_identity(_safe_decrypt(out["identity_number"]))
+    if out.get("gsm_number"):
+        out["gsm_number"] = mask_phone(_safe_decrypt(out["gsm_number"]))
+    return out
 
 
 async def _active_sub(user_id: str) -> Optional[Dict[str, Any]]:
@@ -113,19 +153,32 @@ async def config(user=Depends(get_current_user)):
 
 @router.get("/profile")
 async def get_profile(user=Depends(get_current_user)):
-    return await db.billing_profiles.find_one({"user_id": user["id"]}, {"_id": 0, "user_id": 0}) or {}
+    profile = await db.billing_profiles.find_one({"user_id": user["id"]}, {"_id": 0, "user_id": 0, "updated_at": 0})
+    return _public_profile(profile) if profile else {}
 
 
 @router.put("/profile")
 async def put_profile(payload: BillingProfile, user=Depends(get_current_user)):
-    await db.billing_profiles.update_one({"user_id": user["id"]}, {"$set": {"user_id": user["id"], **payload.model_dump(), "updated_at": now_iso()}}, upsert=True)
-    return payload.model_dump()
+    existing = await db.billing_profiles.find_one({"user_id": user["id"]}, {"_id": 0}) or {}
+    data = payload.model_dump()
+    try:
+        # Maskeli değer geldiyse eski kayıt korunur; yeni değer geldiyse şifrelenir
+        data["identity_number"] = encrypt_pii(protect(payload.identity_number, existing.get("identity_number", "")))
+        data["gsm_number"] = encrypt_pii(protect(payload.gsm_number, existing.get("gsm_number", "")))
+    except RuntimeError as e:
+        logger.error("PII şifreleme hatası: %s", e)
+        raise HTTPException(503, "Sunucu yapılandırması eksik, daha sonra tekrar dene")
+    if not data["identity_number"] or not data["gsm_number"]:
+        raise HTTPException(400, "Telefon ve TC kimlik no gerekli")
+    await db.billing_profiles.update_one({"user_id": user["id"]}, {"$set": {"user_id": user["id"], **data, "updated_at": now_iso()}}, upsert=True)
+    return _public_profile(data)
 
 
 def _buyer(user: Dict[str, Any], profile: Dict[str, Any], ip: str) -> Dict[str, Any]:
+    # decrypt_pii, eski (düz metin) kayıtları olduğu gibi döndürür
     return {
-        "id": user["id"], "name": profile["name"], "surname": profile["surname"], "gsmNumber": profile["gsm_number"],
-        "email": user["email"], "identityNumber": profile["identity_number"], "registrationAddress": profile["address"],
+        "id": user["id"], "name": profile["name"], "surname": profile["surname"], "gsmNumber": decrypt_pii(profile["gsm_number"]),
+        "email": user["email"], "identityNumber": decrypt_pii(profile["identity_number"]), "registrationAddress": profile["address"],
         "ip": ip or "85.34.78.112", "city": profile["city"], "country": "Turkey", "zipCode": profile.get("zip_code") or "",
     }
 
@@ -153,10 +206,15 @@ async def checkout(payload: CheckoutIn, request: Request, user=Depends(get_curre
     conversation = str(uuid.uuid4())
     origin = payload.origin_url.rstrip("/")
     ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "")
+    try:
+        buyer = _buyer(user, profile, ip)
+    except RuntimeError as e:
+        logger.error("PII çözülemedi: %s", e)
+        raise HTTPException(503, "Sunucu yapılandırması eksik, daha sonra tekrar dene")
     body = {
-        "locale": "tr", "conversationId": conversation, "callbackUrl": "http://localhost:8000/api/billing/iyzico/callback",
+        "locale": "tr", "conversationId": conversation, "callbackUrl": f"{PUBLIC_BASE_URL}/api/billing/iyzico/callback",
         "enabledInstallments": ["1"], "registerCard": "1",
-        "buyer": _buyer(user, profile, ip), "billingAddress": _address(profile), "shippingAddress": _address(profile),
+        "buyer": buyer, "billingAddress": _address(profile), "shippingAddress": _address(profile),
         **_basket(f"PRO-{conversation[:8]}"),
     }
     out = await iyzi(iyzipay.CheckoutFormInitialize, "create", body)
@@ -197,9 +255,13 @@ async def _finalize_token(token: str) -> Dict[str, Any]:
         raise HTTPException(404, "Ödeme oturumu bulunamadı")
     if checkout["status"] in ("completed", "failed"):
         return checkout
+    # Gerçek sonuç her zaman iyzico'dan token ile sorgulanır; istekteki hiçbir şeye güvenilmez
     result = await iyzi(iyzipay.CheckoutForm, "retrieve", {"locale": "tr", "token": token})
-    if result.get("paymentStatus") != "SUCCESS":
-        await db.checkouts.update_one({"token": token}, {"$set": {"status": "failed", "error": result.get("errorMessage"), "updated_at": now_iso()}})
+    payment_status = result.get("paymentStatus")
+    if payment_status != "SUCCESS":
+        # Sadece kesin başarısızlıkta "failed" işaretlenir; ödeme sürüyorsa oturum açık kalır
+        if payment_status == "FAILURE":
+            await db.checkouts.update_one({"token": token}, {"$set": {"status": "failed", "error": result.get("errorMessage"), "updated_at": now_iso()}})
         raise HTTPException(402, result.get("errorMessage") or "Ödeme tamamlanmadı")
     sub = await _activate(checkout["user_id"], result)
     await db.checkouts.update_one({"token": token}, {"$set": {"status": "completed", "subscription_id": sub["id"], "updated_at": now_iso()}})
@@ -207,42 +269,45 @@ async def _finalize_token(token: str) -> Dict[str, Any]:
     return checkout
 
 
-@router.post("/iyzico/callback")
+def _result_page(ok: bool) -> HTMLResponse:
+    """3DS sonrası tarayıcıda gösterilen basit sayfa. Uygulama durumu kendi sorgular (/billing/status/{token})."""
+    title = "Ödeme başarılı" if ok else "Ödeme tamamlanamadı"
+    text = ("PRO üyeliğin etkinleştirildi. Bu pencereyi kapatıp Weird Studio uygulamasına dönebilirsin."
+            if ok else "Ödeme doğrulanamadı. Uygulamaya dönüp tekrar deneyebilirsin.")
+    page = (
+        "<!doctype html><html lang='tr'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{html.escape(title)}</title>"
+        "<style>body{font-family:system-ui,sans-serif;background:#0b0b12;color:#fff;display:flex;"
+        "align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}"
+        "div{max-width:420px;padding:24px}h1{font-size:22px}p{color:#aab}</style></head><body><div>"
+        f"<h1>{'✅' if ok else '⚠️'} {html.escape(title)}</h1><p>{html.escape(text)}</p></div></body></html>"
+    )
+    return HTMLResponse(page)
+
+
+@router.post("/iyzico/callback", response_class=HTMLResponse)
 async def iyzico_callback(request: Request):
+    # Eskiden token'ı doğrulamadan kullanıcıyı PRO yapıyordu (herkes bedava PRO alabilirdi).
+    # Artık ödeme iyzico'dan sorgulanıp doğrulanır (_finalize_token).
+    token = None
     try:
         form = await request.form()
         token = form.get("token")
-        
-        print(f"--> IYZICO CALLBACK TETIKLENDI. TOKEN: {token}")
-
-        if not token:
-            return RedirectResponse("http://localhost:3000/?payment=failed", status_code=303)
-
-        # 1. Ödeme kaydını token ile veritabanından bul
-        checkout = await db.checkouts.find_one({"token": token})
-        if not checkout:
-            print("--> HATA: Checkout kaydı bulunamadı!")
-            return RedirectResponse("http://localhost:3000/?payment=failed", status_code=303)
-
-        user_id = checkout.get("user_id")
-
-        # 2. Kullanıcıyı MongoDB'de hem _id hem id alanlarına göre ara ve PRO yap
-        result = await db.users.update_one(
-            {"$or": [{"_id": user_id}, {"id": user_id}]},
-            {"$set": {"is_pro": True}}
-        )
-        
-        await db.checkouts.update_one({"token": token}, {"$set": {"status": "success"}})
-        
-        print(f"--> KULLANICI PRO YAPILDI (Guncellenen: {result.modified_count}): {user_id}")
-
-        # 3. Frontend'e başarılı yönlendirme yap
-        return RedirectResponse("http://localhost:3000/?payment=success", status_code=303)
-
     except Exception as e:
-        print(f"--> CALLBACK HATA ALDI: {str(e)}")
-        return RedirectResponse("http://localhost:3000/?payment=error", status_code=303)
-        
+        logger.error("Callback form okunamadı: %s", e)
+    if not token or not isinstance(token, str):
+        return _result_page(False)
+    try:
+        checkout = await _finalize_token(token)
+        return _result_page(checkout["status"] == "completed")
+    except HTTPException:
+        return _result_page(False)
+    except Exception as e:
+        logger.error("Callback hatası: %s", e)
+        return _result_page(False)
+
+
 @router.post("/iyzico/webhook")
 async def iyzico_webhook(request: Request):
     # Payload is only a hint; the truth is fetched from iyzico by token (no trust in the body).
@@ -335,11 +400,16 @@ async def renew_subscription(sub: Dict[str, Any]) -> bool:
     profile = await db.billing_profiles.find_one({"user_id": sub["user_id"]}, {"_id": 0})
     if not user or not profile or not sub.get("card_user_key"):
         return False
+    try:
+        buyer = _buyer(user, profile, "")
+    except RuntimeError as e:
+        logger.error("Yenileme atlandı, PII çözülemedi (%s): %s", sub["id"], e)
+        return False
     conversation = str(uuid.uuid4())
     body = {
         "locale": "tr", "conversationId": conversation, "installment": "1",
         "paymentCard": {"cardUserKey": sub["card_user_key"], "cardToken": sub["card_token"]},
-        "buyer": _buyer(user, profile, ""), "billingAddress": _address(profile), "shippingAddress": _address(profile),
+        "buyer": buyer, "billingAddress": _address(profile), "shippingAddress": _address(profile),
         **_basket(f"RENEW-{conversation[:8]}"),
     }
     try:
