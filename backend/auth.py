@@ -250,28 +250,36 @@ async def resend_code(payload: EmailIn):
 @router.post("/verify")
 async def verify(payload: VerifyRequest):
     email = payload.email.lower().strip()
+
     user = await db.users.find_one({"email": email}, {"_id": 0})
     if not user:
         raise HTTPException(404, "Hesap bulunamadı")
-    
-    # Kod kontrolünü atlayıp direkt hesabı aktif hale getiriyoruz
-    await db.users.update_one({"email": email}, {"$set": {"is_verified": True, "verified_at": now_utc().isoformat()}})
+
+    if user.get("is_verified"):
+        raise HTTPException(400, "Hesap zaten doğrulanmış")
+
+    # GERÇEK OTP KONTROLÜ
+    await consume_otp(email, "verify", payload.code)
+
+    await db.users.update_one(
+        {"email": email},
+        {
+            "$set": {
+                "is_verified": True,
+                "verified_at": now_utc().isoformat()
+            }
+        }
+    )
+
     user["is_verified"] = True
-    
+
     if on_verified:
         await on_verified(user["id"])
-        
+
     token_value = create_access_token(user["id"], email)
-    
+
     return {
         "access_token": token_value,
-        "token": token_value,
-        "accessToken": token_value,
-        "jwt": token_value,
-        "data": {
-            "token": token_value,
-            "access_token": token_value
-        },
         "token_type": "bearer",
         "user": public_user(user)
     }
