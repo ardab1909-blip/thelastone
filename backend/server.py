@@ -326,7 +326,7 @@ async def list_uploads(user=Depends(get_current_user)):
     for d in docs:
         d["url"] = f"/api/uploads/{d['id']}"
         d["display_name"] = d.get("display_name") or d["original_filename"]
-        d["used_by"] = [{"profile": p["name"], "index": t["index"]} for p in profiles for t in p["tiles"] if t.get("sound_url"] == d["url"]]
+        d["used_by"] = [{"profile": p["name"], "index": t["index"]} for p in profiles for t in p["tiles"] if t.get("sound_url") == d["url"]]
     return docs
 
 class UploadRename(BaseModel):
