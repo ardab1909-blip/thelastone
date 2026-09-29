@@ -69,10 +69,9 @@ async def lifespan(app: FastAPI):
 # ---------- App Initialization ----------
 app = FastAPI(title="WEIRD STUDIO Stream Deck Pro API", lifespan=lifespan)
 
-# CORS middleware (Tüm kaynaklardan gelen isteklere izin veriyoruz)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=".*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
