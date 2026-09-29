@@ -1,3 +1,6 @@
+dnspython
+motor
 fastapi
 uvicorn
 pydantic
+python-dotenv
