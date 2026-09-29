@@ -68,7 +68,9 @@ async def lifespan(app: FastAPI):
 
 # ---------- App Initialization ----------
 app = FastAPI(title="WEIRD STUDIO Stream Deck Pro API", lifespan=lifespan)
-
+@app.get("/")
+async def root():
+    return {"app": "WEIRD STUDIO Stream Deck Pro", "status": "ok"}
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=".*",
