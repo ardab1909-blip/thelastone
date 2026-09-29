@@ -222,12 +222,7 @@ async def register(payload: RegisterIn):
     }
     await db.users.replace_one({"email": email}, user, upsert=True)
     otp = await issue_otp(email, "verify")
-return {
-    "message": "Doğrulama kodu gönderildi",
-    "email": email,
-    "needs_verification": True,
-    **otp
-}
+    return {"message": "Doğrulama kodu gönderildi", "email": email, **otp}
 
 
 @router.post("/resend-code")
