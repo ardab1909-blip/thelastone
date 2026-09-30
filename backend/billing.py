@@ -1,5 +1,13 @@
 """Billing: iyzico Checkout Form (card + 3DS hosted by iyzico) with stored-card monthly renewals.
-PRO = ₺149/ay. First charge via hosted form (registerCard), renewals charged server-side from the stored card."""
+PRO = ₺149/ay. First charge via hosted form (registerCard), renewals charged server-side from the stored card.
+
+Render ortam değişkenleri:
+  IYZICO_API_KEY, IYZICO_SECRET_KEY   (zorunlu)
+  IYZICO_BASE_URL                     (sandbox: https://sandbox-api.iyzipay.com | canlı: https://api.iyzipay.com)
+  PUBLIC_BASE_URL                     (ör. https://thelastone-o7fj.onrender.com)
+  API_PREFIX                          (router'ı server.py'de hangi prefix ile eklediysen, varsayılan /api)
+  IYZICO_MERCHANT_ID                  (isteğe bağlı, kodda kullanılmıyor)
+"""
 import os
 import re
 import json
@@ -8,13 +16,14 @@ import uuid
 import asyncio
 import logging
 import calendar
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 
 import iyzipay
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import PlainTextResponse, HTMLResponse
 from pydantic import BaseModel, Field, field_validator
+from pymongo import ReturnDocument
 
 from auth import get_current_user, public_user
 from pii import encrypt_pii, decrypt_pii, is_masked, mask_identity, mask_phone, protect
@@ -24,16 +33,23 @@ db = None
 
 API_KEY = os.environ.get("IYZICO_API_KEY", "")
 SECRET = os.environ.get("IYZICO_SECRET_KEY", "")
-MERCHANT_ID = os.environ.get("IYZICO_MERCHANT_ID", "")
 BASE = os.environ.get("IYZICO_BASE_URL", "https://sandbox-api.iyzipay.com").rstrip("/")
 OPTIONS = {"api_key": API_KEY, "secret_key": SECRET, "base_url": BASE.replace("https://", "")}
 
 # iyzico'nun 3DS sonrası tarayıcıyı yönlendireceği herkese açık backend adresi (Render adresin)
-PUBLIC_BASE_URL=https://thelastone-o7fj.onrender.com
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://thelastone-o7fj.onrender.com").rstrip("/")
+# billing router'ının server.py'de eklendiği prefix (callback adresi buna göre kurulur)
+_prefix = os.environ.get("API_PREFIX", "/api").strip("/")
+API_PREFIX = f"/{_prefix}" if _prefix else ""
 
 PLAN = {"name": "WEIRD STUDIO PRO — Aylık", "price": 149.0, "currency": "TRY", "symbol": "₺"}
 RENEW_CHECK_SECONDS = 3600
-GRACE_DAYS = 3
+GRACE_DAYS = 3               # ilk başarısız çekimden sonra en fazla bu kadar tekrar denenir
+RETRY_INTERVAL_HOURS = 24    # tekrar denemeler arası süre
+LEASE_MINUTES = 15           # bir abonelik yenilenirken diğer işlemlerin dokunmaması için kilit süresi
+
+# Abonelik dokümanlarından istemciye asla dönmeyecek alanlar
+HIDE_SUB = {"_id": 0, "card_user_key": 0, "card_token": 0, "renewing_until": 0}
 
 
 def configure(database):
@@ -42,7 +58,7 @@ def configure(database):
 
 
 def configured() -> bool:
-    return bool(API_KEY and SECRET and MERCHANT_ID)
+    return bool(API_KEY and SECRET)
 
 
 def now() -> datetime:
@@ -139,7 +155,10 @@ def _public_profile(p: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def _active_sub(user_id: str) -> Optional[Dict[str, Any]]:
-    return await db.subscriptions.find_one({"user_id": user_id, "status": {"$in": ["ACTIVE", "CANCELED", "PAYMENT_FAILED"]}}, {"_id": 0, "card_user_key": 0, "card_token": 0}, sort=[("started_at", -1)])
+    return await db.subscriptions.find_one(
+        {"user_id": user_id, "status": {"$in": ["ACTIVE", "CANCELED", "PAYMENT_FAILED"]}},
+        HIDE_SUB, sort=[("started_at", -1)],
+    )
 
 
 @router.get("/config")
@@ -179,6 +198,7 @@ def _buyer(user: Dict[str, Any], profile: Dict[str, Any], ip: str) -> Dict[str, 
     return {
         "id": user["id"], "name": profile["name"], "surname": profile["surname"], "gsmNumber": decrypt_pii(profile["gsm_number"]),
         "email": user["email"], "identityNumber": decrypt_pii(profile["identity_number"]), "registrationAddress": profile["address"],
+        # iyzico IP alanını zorunlu tutar; gerçek IP alınamazsa sandbox'ta işe yarayan yedek değer kullanılır
         "ip": ip or "85.34.78.112", "city": profile["city"], "country": "Turkey", "zipCode": profile.get("zip_code") or "",
     }
 
@@ -212,7 +232,7 @@ async def checkout(payload: CheckoutIn, request: Request, user=Depends(get_curre
         logger.error("PII çözülemedi: %s", e)
         raise HTTPException(503, "Sunucu yapılandırması eksik, daha sonra tekrar dene")
     body = {
-        "locale": "tr", "conversationId": conversation, "callbackUrl": f"{PUBLIC_BASE_URL}/api/billing/iyzico/callback",
+        "locale": "tr", "conversationId": conversation, "callbackUrl": f"{PUBLIC_BASE_URL}{API_PREFIX}/billing/iyzico/callback",
         "enabledInstallments": ["1"], "registerCard": "1",
         "buyer": buyer, "billingAddress": _address(profile), "shippingAddress": _address(profile),
         **_basket(f"PRO-{conversation[:8]}"),
@@ -225,6 +245,10 @@ async def checkout(payload: CheckoutIn, request: Request, user=Depends(get_curre
     return {"token": out["token"], "checkout_form_content": out["checkoutFormContent"], "payment_page_url": out.get("paymentPageUrl")}
 
 
+def _enc(value: Optional[str]) -> str:
+    return encrypt_pii(value) if value else ""
+
+
 async def _activate(user_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
     """Idempotently records the first successful payment as an ACTIVE monthly subscription."""
     payment_id = str(result.get("paymentId"))
@@ -232,12 +256,20 @@ async def _activate(user_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
     if existing:
         return existing
     start = now()
+    try:
+        # Kart anahtarları veritabanında şifreli tutulur (eski düz metin kayıtlar decrypt_pii ile yine okunur)
+        card_user_key = _enc(result.get("cardUserKey"))
+        card_token = _enc(result.get("cardToken"))
+    except RuntimeError as e:
+        # Ödeme alındı ama kayıt yapılamadı: istek 503 döner, oturum "started" kalır ve sonraki sorguda tekrar denenir
+        logger.error("Kart anahtarı şifrelenemedi (payment %s): %s", payment_id, e)
+        raise HTTPException(503, "Sunucu yapılandırması eksik, daha sonra tekrar dene")
     sub = {
         "id": str(uuid.uuid4()), "user_id": user_id, "first_payment_id": payment_id, "status": "ACTIVE",
-        "card_user_key": result.get("cardUserKey"), "card_token": result.get("cardToken"),
+        "card_user_key": card_user_key, "card_token": card_token,
         "card_last4": result.get("lastFourDigits"), "card_association": result.get("cardAssociation"),
         "amount": PLAN["price"], "currency": PLAN["currency"], "started_at": start.isoformat(),
-        "renews_at": add_month(start).isoformat(), "cancel_at_period_end": False,
+        "renews_at": add_month(start).isoformat(), "cancel_at_period_end": False, "failed_attempts": 0,
         "invoice_no": f"WS-{start.strftime('%Y%m%d')}-{payment_id[-6:].upper()}",
         "orders": [{"payment_id": payment_id, "at": start.isoformat(), "amount": PLAN["price"], "status": "success"}],
         "updated_at": start.isoformat(),
@@ -288,8 +320,7 @@ def _result_page(ok: bool) -> HTMLResponse:
 
 @router.post("/iyzico/callback", response_class=HTMLResponse)
 async def iyzico_callback(request: Request):
-    # Eskiden token'ı doğrulamadan kullanıcıyı PRO yapıyordu (herkes bedava PRO alabilirdi).
-    # Artık ödeme iyzico'dan sorgulanıp doğrulanır (_finalize_token).
+    # Ödeme her zaman iyzico'dan sorgulanıp doğrulanır (_finalize_token); istekteki veriye güvenilmez.
     token = None
     try:
         form = await request.form()
@@ -316,7 +347,7 @@ async def iyzico_webhook(request: Request):
     except Exception:
         payload = {}
     token = payload.get("token")
-    if token and await db.checkouts.find_one({"token": token}):
+    if token and isinstance(token, str) and await db.checkouts.find_one({"token": token}):
         try:
             await _finalize_token(token)
         except HTTPException:
@@ -335,7 +366,7 @@ async def status(token: str, user=Depends(get_current_user)):
         except HTTPException:
             checkout = await db.checkouts.find_one({"token": token}, {"_id": 0})
     fresh = await db.users.find_one({"id": user["id"]}, {"_id": 0})
-    sub = await db.subscriptions.find_one({"id": checkout.get("subscription_id")}, {"_id": 0, "card_user_key": 0, "card_token": 0}) if checkout.get("subscription_id") else None
+    sub = await db.subscriptions.find_one({"id": checkout.get("subscription_id")}, HIDE_SUB) if checkout.get("subscription_id") else None
     return {"status": checkout["status"], "error": checkout.get("error"), "subscription": sub, "user": public_user(fresh)}
 
 
@@ -348,13 +379,17 @@ async def cancel(user=Depends(get_current_user)):
             user.update({"is_pro": False, "plan": "free", "pro_since": None})
             return {"user": public_user(user), "access_until": None}
         raise HTTPException(400, "Aktif PRO aboneliği yok")
-    await db.subscriptions.update_one({"id": sub["id"]}, {"$set": {"status": "CANCELED", "cancel_at_period_end": True, "cancelled_at": now_iso(), "updated_at": now_iso()}})
+    await db.subscriptions.update_one(
+        {"id": sub["id"]},
+        {"$set": {"status": "CANCELED", "cancel_at_period_end": True, "cancelled_at": now_iso(), "updated_at": now_iso()},
+         "$unset": {"next_attempt_at": ""}},
+    )
     return {"user": public_user(user), "access_until": sub["renews_at"]}
 
 
 @router.get("/history")
 async def history(user=Depends(get_current_user)):
-    return await db.subscriptions.find({"user_id": user["id"]}, {"_id": 0, "card_user_key": 0, "card_token": 0}).sort("started_at", -1).to_list(50)
+    return await db.subscriptions.find({"user_id": user["id"]}, HIDE_SUB).sort("started_at", -1).to_list(50)
 
 
 def _invoice_text(user: Dict[str, Any], sub: Dict[str, Any]) -> str:
@@ -395,20 +430,70 @@ async def invoice(sub_id: str, user=Depends(get_current_user)):
 
 
 # ---------- Monthly renewals (stored card, server-side) ----------
-async def renew_subscription(sub: Dict[str, Any]) -> bool:
+async def _claim_due_subscription(sub_id: str) -> Optional[Dict[str, Any]]:
+    """Aboneliği atomik olarak sahiplenir. Başka bir işlem/instance aynı anda çekim yapamaz (çift çekimi önler)."""
+    t = now()
+    t_iso = t.isoformat()
+    return await db.subscriptions.find_one_and_update(
+        {
+            "id": sub_id, "status": "ACTIVE", "renews_at": {"$lte": t_iso},
+            "$and": [
+                {"$or": [{"renewing_until": {"$exists": False}}, {"renewing_until": None}, {"renewing_until": {"$lte": t_iso}}]},
+                {"$or": [{"next_attempt_at": {"$exists": False}}, {"next_attempt_at": None}, {"next_attempt_at": {"$lte": t_iso}}]},
+            ],
+        },
+        {"$set": {"renewing_until": (t + timedelta(minutes=LEASE_MINUTES)).isoformat()}},
+        projection={"_id": 0}, return_document=ReturnDocument.AFTER,
+    )
+
+
+async def _release(sub_id: str, retry_in_minutes: int) -> None:
+    """Çekim yapmadan kilidi bırakır (ör. sunucu yapılandırma hatası); kullanıcının deneme hakkı yanmaz."""
+    await db.subscriptions.update_one(
+        {"id": sub_id},
+        {"$set": {"next_attempt_at": (now() + timedelta(minutes=retry_in_minutes)).isoformat(), "updated_at": now_iso()},
+         "$unset": {"renewing_until": ""}},
+    )
+
+
+async def _record_renewal_failure(sub: Dict[str, Any], payment_id: str) -> str:
+    attempts = int(sub.get("failed_attempts", 0)) + 1
+    order = {"payment_id": payment_id, "at": now_iso(), "amount": PLAN["price"], "status": "failure"}
+    if attempts <= GRACE_DAYS:
+        # Ek süre: üyelik açık kalır, bir sonraki gün tekrar denenir
+        await db.subscriptions.update_one(
+            {"id": sub["id"]},
+            {"$set": {"failed_attempts": attempts, "next_attempt_at": (now() + timedelta(hours=RETRY_INTERVAL_HOURS)).isoformat(), "updated_at": now_iso()},
+             "$unset": {"renewing_until": ""}, "$push": {"orders": order}},
+        )
+        return "retry"
+    await db.subscriptions.update_one(
+        {"id": sub["id"]},
+        {"$set": {"status": "PAYMENT_FAILED", "failed_attempts": attempts, "updated_at": now_iso()},
+         "$unset": {"renewing_until": "", "next_attempt_at": ""}, "$push": {"orders": order}},
+    )
+    await db.users.update_one({"id": sub["user_id"]}, {"$set": {"is_pro": False, "plan": "free"}})
+    return "failed"
+
+
+async def renew_subscription(sub: Dict[str, Any]) -> str:
+    """Sahiplenilmiş (kilitli) bir aboneliği yeniler. 'renewed' | 'retry' | 'failed' | 'skipped' döner."""
     user = await db.users.find_one({"id": sub["user_id"]}, {"_id": 0})
     profile = await db.billing_profiles.find_one({"user_id": sub["user_id"]}, {"_id": 0})
     if not user or not profile or not sub.get("card_user_key"):
-        return False
+        return await _record_renewal_failure(sub, "missing-profile-or-card")
     try:
         buyer = _buyer(user, profile, "")
+        card_user_key = decrypt_pii(sub["card_user_key"])
+        card_token = decrypt_pii(sub["card_token"])
     except RuntimeError as e:
         logger.error("Yenileme atlandı, PII çözülemedi (%s): %s", sub["id"], e)
-        return False
+        await _release(sub["id"], retry_in_minutes=60)
+        return "skipped"
     conversation = str(uuid.uuid4())
     body = {
         "locale": "tr", "conversationId": conversation, "installment": "1",
-        "paymentCard": {"cardUserKey": sub["card_user_key"], "cardToken": sub["card_token"]},
+        "paymentCard": {"cardUserKey": card_user_key, "cardToken": card_token},
         "buyer": buyer, "billingAddress": _address(profile), "shippingAddress": _address(profile),
         **_basket(f"RENEW-{conversation[:8]}"),
     }
@@ -418,24 +503,43 @@ async def renew_subscription(sub: Dict[str, Any]) -> bool:
         payment_id = str(result.get("paymentId", ""))
     except HTTPException as e:
         ok, payment_id = False, str(e.detail)
-    order = {"payment_id": payment_id, "at": now_iso(), "amount": PLAN["price"], "status": "success" if ok else "failure"}
-    if ok:
+    if not ok:
+        outcome = await _record_renewal_failure(sub, payment_id)
+        logger.info("Renewal for %s failed -> %s", sub["id"], outcome)
+        return outcome
+    try:
         renews = add_month(parse_iso(sub["renews_at"]))
-        await db.subscriptions.update_one({"id": sub["id"]}, {"$set": {"status": "ACTIVE", "renews_at": renews.isoformat(), "updated_at": now_iso()}, "$push": {"orders": order}})
+        if renews <= now():  # uzun süre çalışmamışsa geçmiş dönemler için arka arkaya çekim yapılmaz
+            renews = add_month(now())
+        order = {"payment_id": payment_id, "at": now_iso(), "amount": PLAN["price"], "status": "success"}
+        await db.subscriptions.update_one(
+            {"id": sub["id"]},
+            {"$set": {"status": "ACTIVE", "renews_at": renews.isoformat(), "failed_attempts": 0, "updated_at": now_iso()},
+             "$unset": {"renewing_until": "", "next_attempt_at": ""}, "$push": {"orders": order}},
+        )
         await db.users.update_one({"id": sub["user_id"]}, {"$set": {"is_pro": True, "plan": "pro_iyzico"}})
-    else:
-        await db.subscriptions.update_one({"id": sub["id"]}, {"$set": {"status": "PAYMENT_FAILED", "updated_at": now_iso()}, "$push": {"orders": order}})
-        await db.users.update_one({"id": sub["user_id"]}, {"$set": {"is_pro": False, "plan": "free"}})
-    logger.info("Renewal for %s: %s", sub["id"], order["status"])
-    return ok
+    except Exception as e:
+        # Para çekildi ama kayıt yazılamadı. Kilit süresi dolunca tekrar çekim riski var; elle kontrol edilmeli.
+        logger.critical("Yenileme ücreti ÇEKİLDİ ama kayıt yazılamadı: sub=%s payment=%s hata=%s", sub["id"], payment_id, e)
+        return "failed"
+    logger.info("Renewal for %s: success", sub["id"])
+    return "renewed"
 
 
 async def run_renewals_once() -> Dict[str, int]:
-    due = now().isoformat()
-    stats = {"renewed": 0, "failed": 0, "expired": 0}
+    due = now_iso()
+    stats = {"renewed": 0, "retry": 0, "failed": 0, "skipped": 0, "expired": 0}
     if configured():
-        async for sub in db.subscriptions.find({"status": "ACTIVE", "renews_at": {"$lte": due}}, {"_id": 0}):
-            stats["renewed" if await renew_subscription(sub) else "failed"] += 1
+        candidates = [s["id"] async for s in db.subscriptions.find({"status": "ACTIVE", "renews_at": {"$lte": due}}, {"_id": 0, "id": 1})]
+        for sub_id in candidates:
+            sub = await _claim_due_subscription(sub_id)
+            if not sub:  # başka bir işlem aldı ya da yeniden deneme zamanı gelmedi
+                continue
+            try:
+                stats[await renew_subscription(sub)] += 1
+            except Exception as e:
+                logger.error("Yenileme hatası (%s): %s", sub_id, e)
+                stats["failed"] += 1
     async for sub in db.subscriptions.find({"status": {"$in": ["CANCELED", "PAYMENT_FAILED"]}, "renews_at": {"$lte": due}}, {"_id": 0}):
         user = await db.users.find_one({"id": sub["user_id"], "is_pro": True, "subscription_id": sub["id"]})
         if user:
