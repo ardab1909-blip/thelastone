@@ -29,7 +29,7 @@ BASE = os.environ.get("IYZICO_BASE_URL", "https://sandbox-api.iyzipay.com").rstr
 OPTIONS = {"api_key": API_KEY, "secret_key": SECRET, "base_url": BASE.replace("https://", "")}
 
 # iyzico'nun 3DS sonrası tarayıcıyı yönlendireceği herkese açık backend adresi (Render adresin)
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://thelastone-07fj.onrender.com").rstrip("/")
+PUBLIC_BASE_URL=https://thelastone-o7fj.onrender.com
 
 PLAN = {"name": "WEIRD STUDIO PRO — Aylık", "price": 149.0, "currency": "TRY", "symbol": "₺"}
 RENEW_CHECK_SECONDS = 3600
